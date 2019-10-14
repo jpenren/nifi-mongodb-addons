@@ -24,7 +24,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.behavior.WritesAttributes;
@@ -48,6 +47,7 @@ import org.apache.nifi.processor.util.JsonValidator;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.util.StringUtils;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 
 import com.mongodb.MongoClient;
 import com.mongodb.MongoClientURI;
@@ -56,7 +56,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 
 @Tags({"mongo", "get", "fetch"})
-@CapabilityDescription("Creates FlowFiles from documents in MongoDB. This implementation differs from the standard GetMongo in that queries are executed using skip() and limit() to retrieve data paginated. NOTE: this is an stateful implementation, skip value is update with each execution. Stop component to restart the skip value.")
+@CapabilityDescription("Creates FlowFiles from documents in MongoDB. This implementation differs from the standard GetMongo in that queries are executed using the latest document _id and limit() to retrieve data paginated. NOTE: this is an stateful implementation, the lastId value is update with each execution. Stop component to restart the lastId value.")
 @WritesAttributes({
     @WritesAttribute(attribute=FetchMongo.ATTR_MIME_TYPE, description="Mime Type as application/json"),
     @WritesAttribute(attribute=FetchMongo.ATTR_DB_NAME, description="The database where the results came from."),
@@ -74,7 +74,6 @@ public class FetchMongo extends AbstractProcessor {
     public static final String ATTR_DB_NAME = "mongo.database.name";
     public static final String ATTR_PAGE_SIZE = "mongo.page.size";
     public static final String ATTR_MIME_TYPE = "mime.type";
-    private static final int FIRST_PAGE = 0;
     
     public static final PropertyDescriptor URI = new PropertyDescriptor.Builder()
             .name("Mongo URI")
@@ -102,10 +101,10 @@ public class FetchMongo extends AbstractProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     
-    public static final PropertyDescriptor PAGE_SIZE = new PropertyDescriptor.Builder()
-            .name("Page Size")
-            .description("Number of elements per page. This property defines the value used within limit() method to specify the maximum number of documents the cursor will return.")
-            .required(true)
+    public static final PropertyDescriptor LIMIT = new PropertyDescriptor.Builder()
+            .name("Limit")
+            .description("Max elements to retrive.")
+            .required(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
             .defaultValue("50")
@@ -131,7 +130,15 @@ public class FetchMongo extends AbstractProcessor {
     
     public static final PropertyDescriptor EXTRACT_FIELDS = new PropertyDescriptor.Builder()
             .name("Extract Fields")
-            .description("The fields to be extracted as mongo.doc.[field] attributes, list of comma separated values")
+            .description("The fields to be extracted as mongo.doc.[field] attributes, comma separated values list")
+            .required(false)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+    
+    public static final PropertyDescriptor REMOVE_FIELDS = new PropertyDescriptor.Builder()
+            .name("Remove Fields")
+            .description("The fields to be removed from document, comma separated values list")
             .required(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
@@ -147,14 +154,14 @@ public class FetchMongo extends AbstractProcessor {
             .description("All input FlowFiles that are part of a failed query execution go here.")
             .build();
 
-    private final AtomicInteger currentPage = new AtomicInteger(FIRST_PAGE);
     private List<PropertyDescriptor> descriptors;
     private Set<Relationship> relationships;
     private MongoClient mongoClient;
+    private String lastId;
 
     @Override
     protected void init(final ProcessorInitializationContext context) {
-        this.descriptors = Collections.unmodifiableList(Arrays.asList(URI, DATABASE_NAME, COLLECTION_NAME, PROJECTION, PAGE_SIZE, CHARSET, EXTRACT_FIELDS));
+        this.descriptors = Collections.unmodifiableList(Arrays.asList(URI, DATABASE_NAME, COLLECTION_NAME, PROJECTION, LIMIT, CHARSET, EXTRACT_FIELDS, REMOVE_FIELDS));
         this.relationships = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(REL_SUCCESS, REL_FAILURE)));
     }
 
@@ -178,62 +185,66 @@ public class FetchMongo extends AbstractProcessor {
     @OnStopped
     public void onStopped() {
         closeClient();
-        currentPage.set(FIRST_PAGE);
+        lastId = null;
         getLogger().debug("Processor stopped");
     }
 
     @Override
-    public void onTrigger(final ProcessContext context, final ProcessSession session) {
+    public synchronized void onTrigger(final ProcessContext context, final ProcessSession session) {
         final ComponentLog logger = getLogger();
-        final Document query = Document.parse("{}");
-        final Document projection = parse(context, PROJECTION);
-        final int pageSize = getProperty(context, PAGE_SIZE).asInteger();
-        final Charset charset = Charset.forName(getProperty(context, CHARSET).getValue());
-        
         final long startup = System.currentTimeMillis();
-        final MongoCollection<Document> collection = getCollection(context);
         
+        final MongoCollection<Document> collection = getCollection(context);
         final Map<String, String> attributes = new HashMap<>();
         attributes.put(CoreAttributes.MIME_TYPE.key(), "application/json");
         attributes.put(ATTR_DB_NAME, collection.getNamespace().getDatabaseName());
         attributes.put(ATTR_COL_NAME, collection.getNamespace().getCollectionName());
-        attributes.put(ATTR_PAGE_SIZE, String.valueOf(pageSize));
         
-        final int skip = currentPage.getAndIncrement() * pageSize;
-        logger.debug("-> find(*).skip({}).limit({})", new Object[] {skip, pageSize});
-        final FindIterable<Document> it = collection.find(query).skip(skip).limit(pageSize);
+        final Document query = Document.parse( lastId==null ? "{}" : String.format("{'_id':{'$gt':ObjectId('%s')}}", lastId) );
+        final FindIterable<Document> it = collection.find(query);
+        
+        final Document projection = parse(context, PROJECTION);
         if (projection != null) {
             it.projection(projection);
         }
+        
+        Integer limit = null;
+        if(context.getProperty(LIMIT).isSet()) {
+            limit = getProperty(context, LIMIT).asInteger();
+            it.limit(limit);
+        }
+        
+        final Charset charset = Charset.forName(getProperty(context, CHARSET).getValue());
 
-        long docs = 0;
-        long index = 0;
+        long sent = 0;
         try (MongoCursor<Document> cursor = it.iterator()) {
             while (cursor.hasNext()) {
                 FlowFile flowFile = session.create();
-                flowFile = session.write(flowFile, out -> {
-                    final Document document = cursor.next();
+                final Document document = cursor.next();
+                ObjectId objectId = document.getObjectId("_id");
+                if(objectId==null) {
+                    logger.error("Document field _id not found");
+                    session.transfer(flowFile, REL_FAILURE);
+                } else {
+                    lastId = objectId.toHexString();
                     extractFields(context, document, attributes);
-                    out.write(document.toJson().getBytes(charset));
-                });
-                
-                attributes.put(ATTR_PAGE_INDEX, String.valueOf(index));
-                attributes.put(ATTR_CURRENT_PAGE, String.valueOf(currentPage.get()));
-                flowFile = session.putAllAttributes(flowFile, attributes);
-                session.getProvenanceReporter().receive(flowFile, getURI(context));
-                session.transfer(flowFile, REL_SUCCESS);
-                index++;
-                docs++;
+                    removeFields(context, document);
+                    flowFile = session.write(flowFile, out -> out.write(document.toJson().getBytes(charset)));
+                    flowFile = session.putAllAttributes(flowFile, attributes);
+                    session.getProvenanceReporter().receive(flowFile, getURI(context));
+                    session.transfer(flowFile, REL_SUCCESS);
+                    sent++;
+                }
             }
         }
         
-        // current page has no elements, preserve current page
-        if (docs == 0) {
-            currentPage.decrementAndGet();
-        }
-        
         final long time = System.currentTimeMillis() - startup;
-        logger.debug("docs: {}, page: {}, time: {}ms", new Object[]{docs, currentPage.get(), time});
+        logger.debug("find({}).limit({}) [sent:{}, lastId:{}, time:{}ms]", new Object[]{query.toJson(), limit, sent, lastId, time});
+        
+        // collection empty
+        if (sent == 0) {
+            context.yield();
+        }
     }
     
     private PropertyValue getProperty(ProcessContext context, PropertyDescriptor property) {
@@ -264,7 +275,7 @@ public class FetchMongo extends AbstractProcessor {
     }
     
     private void extractFields(ProcessContext context, Document document, Map<String, String> attributes) {
-        if(context.getProperty(EXTRACT_FIELDS).isSet()) {
+        if( context.getProperty(EXTRACT_FIELDS).isSet() ) {
             final String[] keys = getProperty(context, EXTRACT_FIELDS).getValue().replace(" ", "").split(",");
             for (String key : keys) {
                 try {                                    
@@ -273,6 +284,15 @@ public class FetchMongo extends AbstractProcessor {
                 } catch(Exception e) {
                     getLogger().error("Field {} not found", new Object[] {key});
                 }
+            }
+        }
+    }
+    
+    private void removeFields(ProcessContext context, Document document) {
+        if( context.getProperty(REMOVE_FIELDS).isSet() ) {
+            final String[] keys = getProperty(context, REMOVE_FIELDS).getValue().replace(" ", "").split(",");
+            for (String key : keys) {
+                document.remove(key);
             }
         }
     }

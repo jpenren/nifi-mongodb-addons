@@ -16,6 +16,7 @@
  */
 package io.github.nifi.processors.mongodb;
 
+import java.io.IOException;
 import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.Collections;
@@ -24,7 +25,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
+import org.apache.nifi.annotation.behavior.PrimaryNodeOnly;
+import org.apache.nifi.annotation.behavior.Stateful;
+import org.apache.nifi.annotation.behavior.TriggerSerially;
 import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -33,18 +40,23 @@ import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyValue;
+import org.apache.nifi.components.state.Scope;
+import org.apache.nifi.components.state.StateManager;
+import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.logging.ComponentLog;
-import org.apache.nifi.processor.AbstractProcessor;
+import org.apache.nifi.processor.AbstractSessionFactoryProcessor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.ProcessSessionFactory;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.JsonValidator;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.util.StopWatch;
 import org.apache.nifi.util.StringUtils;
 import org.bson.Document;
 import org.bson.types.ObjectId;
@@ -55,24 +67,27 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 
-@Tags({"mongo", "get", "fetch"})
-@CapabilityDescription("Creates FlowFiles from documents in MongoDB. This implementation differs from the standard GetMongo in that queries are executed using the latest document _id and limit() to retrieve data paginated. NOTE: this is an stateful implementation, the lastId value is update with each execution. Stop component to restart the lastId value.")
+@TriggerSerially
+@PrimaryNodeOnly
+@Tags({"mongo", "get", "fetch", "query"})
+@InputRequirement(Requirement.INPUT_FORBIDDEN)
+@CapabilityDescription("Creates FlowFiles from documents in MongoDB. This implementation differs from the standard GetMongo in that queries are executed using the last document _id retrieved and limit() to retrieve data paginated. NOTE: this is an stateful implementation, the lastId value is update with each execution. Stop component and clear the state of the Processor.")
 @WritesAttributes({
-    @WritesAttribute(attribute=FetchMongo.ATTR_MIME_TYPE, description="Mime Type as application/json"),
-    @WritesAttribute(attribute=FetchMongo.ATTR_DB_NAME, description="The database where the results came from."),
-    @WritesAttribute(attribute = FetchMongo.ATTR_COL_NAME, description = "The collection where the results came from."),
-    @WritesAttribute(attribute = FetchMongo.ATTR_CURRENT_PAGE, description = "The current page."),
-    @WritesAttribute(attribute = FetchMongo.ATTR_PAGE_SIZE, description = "Items per page."),
+    @WritesAttribute(attribute=QueryMongoCollection.ATTR_MIME_TYPE, description="Mime Type as application/json"),
+    @WritesAttribute(attribute=QueryMongoCollection.ATTR_DB_NAME, description="The database where the results came from."),
+    @WritesAttribute(attribute = QueryMongoCollection.ATTR_COL_NAME, description = "The collection where the results came from."),
     @WritesAttribute(attribute = "mongo.doc.[field]", description = "Fiels defined in Extract Fields property.")
     
 })
-public class FetchMongo extends AbstractProcessor {
+@Stateful(scopes = Scope.CLUSTER, description = "After performing a query on the specified collection, the last document._id "
+        + "will be retained for use in future executions of the query. This allows the Processor "
+        + "to fetch only those documents that have _id values greater than the retained value. This can be used for "
+        + "incremental fetching, fetching of newly added documents, etc. To clear the latest id, clear the state of the processor.")
+public class QueryMongoCollection extends AbstractSessionFactoryProcessor {
 
-    public static final String ATTR_PAGE_INDEX = "mongo.current.page.index";
-    public static final String ATTR_CURRENT_PAGE = "mongo.current.page";
     public static final String ATTR_COL_NAME = "mongo.collection.name";
+    private static final String LAST_DOCUMENT_ID ="last.document.id";
     public static final String ATTR_DB_NAME = "mongo.database.name";
-    public static final String ATTR_PAGE_SIZE = "mongo.page.size";
     public static final String ATTR_MIME_TYPE = "mime.type";
     
     public static final PropertyDescriptor URI = new PropertyDescriptor.Builder()
@@ -82,6 +97,7 @@ public class FetchMongo extends AbstractProcessor {
             .required(true)
             .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .defaultValue("mongodb://localhost:27017")
             .build();
     
     private static final PropertyDescriptor DATABASE_NAME = new PropertyDescriptor.Builder()
@@ -122,7 +138,7 @@ public class FetchMongo extends AbstractProcessor {
     
     public static final PropertyDescriptor PROJECTION = new PropertyDescriptor.Builder()
             .name("Projection")
-            .description("The fields to be returned from the documents in the result set; must be a valid BSON document")
+            .description("The fields to be returned from the documents in the result set; must be a valid BSON document.")
             .required(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(JsonValidator.INSTANCE)
@@ -130,7 +146,7 @@ public class FetchMongo extends AbstractProcessor {
     
     public static final PropertyDescriptor EXTRACT_FIELDS = new PropertyDescriptor.Builder()
             .name("Extract Fields")
-            .description("The fields to be extracted as mongo.doc.[field] attributes, comma separated values list")
+            .description("The fields to be extracted as mongo.doc.[field] attributes, comma separated values list.")
             .required(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
@@ -138,9 +154,16 @@ public class FetchMongo extends AbstractProcessor {
     
     public static final PropertyDescriptor REMOVE_FIELDS = new PropertyDescriptor.Builder()
             .name("Remove Fields")
-            .description("The fields to be removed from document, comma separated values list")
+            .description("The fields to be removed from document, comma separated values list.")
             .required(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+    
+    public static final PropertyDescriptor INITIAL_DOCUMENT_ID = new PropertyDescriptor.Builder()
+            .name("Initial Document Id")
+            .description("Document Id to fetch documents greater than.")
+            .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     
@@ -161,7 +184,7 @@ public class FetchMongo extends AbstractProcessor {
 
     @Override
     protected void init(final ProcessorInitializationContext context) {
-        this.descriptors = Collections.unmodifiableList(Arrays.asList(URI, DATABASE_NAME, COLLECTION_NAME, PROJECTION, LIMIT, CHARSET, EXTRACT_FIELDS, REMOVE_FIELDS));
+        this.descriptors = Collections.unmodifiableList(Arrays.asList(URI, DATABASE_NAME, COLLECTION_NAME, CHARSET, PROJECTION, LIMIT, EXTRACT_FIELDS, REMOVE_FIELDS, INITIAL_DOCUMENT_ID));
         this.relationships = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(REL_SUCCESS, REL_FAILURE)));
     }
 
@@ -189,11 +212,28 @@ public class FetchMongo extends AbstractProcessor {
         getLogger().debug("Processor stopped");
     }
 
-    @Override
-    public synchronized void onTrigger(final ProcessContext context, final ProcessSession session) {
+    public final void onTrigger(final ProcessContext context, final ProcessSessionFactory sessionFactory) {
+        final ProcessSession session = sessionFactory.createSession();
         final ComponentLog logger = getLogger();
-        final long startup = System.currentTimeMillis();
         
+        final StateManager stateManager = context.getStateManager();
+        final StateMap stateMap;
+
+        try {
+            stateMap = stateManager.getState(Scope.CLUSTER);
+        } catch (final IOException ioe) {
+            getLogger().error("Failed to retrieve values from the State Manager.", ioe);
+            context.yield();
+            return;
+        }
+        
+        lastId = stateMap.get(LAST_DOCUMENT_ID);
+        // Initial doc.id present and not stored in state
+        if( lastId==null && context.getProperty(INITIAL_DOCUMENT_ID).isSet() ) {
+            lastId = getProperty(context, INITIAL_DOCUMENT_ID).getValue();
+        }
+        
+        final StopWatch executionTime = new StopWatch(true);
         final MongoCollection<Document> collection = getCollection(context);
         final Map<String, String> attributes = new HashMap<>();
         attributes.put(CoreAttributes.MIME_TYPE.key(), "application/json");
@@ -236,14 +276,26 @@ public class FetchMongo extends AbstractProcessor {
                     sent++;
                 }
             }
-        }
-        
-        final long time = System.currentTimeMillis() - startup;
-        logger.debug("find({}).limit({}) [sent:{}, lastId:{}, time:{}ms]", new Object[]{query.toJson(), limit, sent, lastId, time});
-        
-        // collection empty
-        if (sent == 0) {
+            
+            final long time = executionTime.getElapsed(TimeUnit.MILLISECONDS);
+            logger.debug("find({}).limit({}) [sent:{}, lastId:{}, time:{}ms]", new Object[]{query.toJson(), limit, sent, lastId, time});
+            
+            // collection empty
+            if (sent == 0) {
+                context.yield();
+            }
+        } catch (Exception e) {
+            logger.error("Unable to query database", new Object[] {e});
             context.yield();
+        } finally {
+            session.commit();
+            try {
+                // Update the state
+                Map<String, String> state = Collections.singletonMap(LAST_DOCUMENT_ID, lastId);
+                stateManager.setState(state, Scope.CLUSTER);
+            } catch (IOException ioe) {
+                getLogger().error("Failed to update State Manager, last.document.id will not be stored", new Object[]{this, ioe});
+            }
         }
     }
     
